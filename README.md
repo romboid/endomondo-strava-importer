@@ -8,13 +8,21 @@ pritom rate limity Stravy.
 
 - Načíta všetky `.tcx` súbory v zadanom adresári a postupne ich nahráva na
   endpoint `POST /api/v3/uploads`.
-- Po každom úspešnom nahraní presunie súbor (aj jeho párový `.json`, ak
-  existuje) do podadresára `processed/`. Vďaka tomu je beh **obnoviteľný** —
-  po prerušení stačí skript spustiť znova a pokračuje tam, kde skončil.
-- Sleduje hlavičku `X-RateLimit-Usage`. Pri 90 requestoch v 15-minútovom okne
-  zaspí na 15 minút, pri 950 requestoch za deň korektne skončí (pokračuj na
-  druhý deň).
-- Medzi jednotlivými uploadmi drží pauzu 1,5 s.
+- **Overí výsledok importu.** HTTP 201 znamená len zaradenie do frontu, preto
+  sa skript následne doptáva na `GET /api/v3/uploads/{id}`, kým Strava nevráti
+  `activity_id` (úspech) alebo `error`.
+- **Presúva len skutočne naimportované súbory** do `processed/` (aj s párovým
+  `.json`). Duplikáty idú do `duplicates/`, pretože v Strave už sú a opakovaný
+  upload by nemal zmysel. Súbory, ktoré zlyhali, zostávajú na mieste, takže sa
+  pri ďalšom behu skúsia znova — beh je teda **obnoviteľný**.
+- **Sám si obnovuje access token.** Ten platí 6 hodín; skript ho obnoví pred
+  expiráciou aj po odmietnutí requestu s HTTP 401, takže dlhý beh neprepadne.
+  Ak Strava vydá nový refresh token, skript ho vypíše.
+- Rate limity číta z hlavičiek `X-RateLimit-Limit` a `X-RateLimit-Usage`, čiže
+  sa prispôsobí limitom tvojej aplikácie. Pri 90 % 15-minútového okna dospí
+  zvyšok okna, pri 90 % denného limitu korektne skončí.
+- Na konci vypíše súhrn: koľko aktivít sa naimportovalo, koľko bolo duplikátov
+  a koľko zlyhalo.
 
 ## Požiadavky
 
@@ -53,27 +61,34 @@ k adresáru s exportom z Endomonda.
 
 ## Build
 
-Samostatný `.exe` pre Windows:
+Samostatný `.exe` pre Windows sa vytvára PyInstallerom. Najjednoduchšie cez
+priložený skript, ktorý doinštaluje závislosti aj PyInstaller a spustí build:
 
-```bash
-pip install pyinstaller
-pyinstaller endomondo-strava-importer.spec
+```powershell
+.\build.ps1
 ```
 
-Výsledok je v `dist/`. Adresáre `build/` a `dist/` sú zámerne v `.gitignore` —
-binárky patria do GitHub Releases, nie do repozitára.
+Ekvivalent naruby:
+
+```bash
+pip install -r requirements.txt pyinstaller
+pyinstaller --noconfirm --clean endomondo-strava-importer.spec
+```
+
+Výsledok je `dist/endomondo-strava-importer.exe` (~12 MB, Python na cieľovom
+stroji netreba). Konfigurácia buildu je v `endomondo-strava-importer.spec`.
+Adresáre `build/` a `dist/` sú zámerne v `.gitignore` — binárky patria do
+GitHub Releases, nie do repozitára.
 
 ## Známe obmedzenia
 
-- **Access token expiruje po 6 hodinách.** Získava sa raz pri štarte, takže
-  veľmi dlhý beh (s 15-minútovými pauzami na rate limit) môže naraziť na 401
-  pri zvyšných súboroch. Riešenie: skript zastaviť a spustiť znova.
-- **HTTP 201 neznamená hotový import.** Strava súbor iba zaradí do frontu;
-  skutočný výsledok (vrátane `duplicate of activity X`) sa dá zistiť až
-  dotazom na `/uploads/{id}`, ktorý skript nerobí. Súbor sa teda presunie do
-  `processed/` aj vtedy, keď ho Strava následne zamietne.
 - Spracúvajú sa len `.tcx` súbory a len v zadanom adresári, nie v podadresároch.
-- Pri prechodných chybách (429, 5xx) sa upload neopakuje.
+- Pri prechodných chybách (429, 5xx) sa upload neopakuje — súbor však zostane
+  na mieste, takže ho zachytí ďalší beh.
+- Ak Strava import nedokončí do ~50 sekúnd, výsledok sa vyhodnotí ako neznámy
+  a súbor zostane na mieste. Pri ďalšom behu sa nahrá znova a skončí ako
+  duplikát.
+- Client Secret sa zadáva cez bežný `input()`, čiže je vidieť v konzole.
 
 ## Licencia
 

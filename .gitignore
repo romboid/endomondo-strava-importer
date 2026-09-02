@@ -20,6 +20,7 @@ dist/
 *.tcx
 *.gpx
 processed/
+duplicates/
 
 # IDE / OS
 .vscode/
