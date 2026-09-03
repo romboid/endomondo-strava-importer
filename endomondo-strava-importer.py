@@ -7,8 +7,8 @@ from datetime import datetime
 TOKEN_URL = "https://www.strava.com/oauth/token"
 UPLOADS_URL = "https://www.strava.com/api/v3/uploads"
 
-# Strava spracúva upload asynchrónne, takže na výsledok sa treba doptať.
-# Postupne narastajúce pauzy medzi dotazmi, spolu max ~51 sekúnd na súbor.
+# Strava processes uploads asynchronously, so the result has to be polled.
+# Increasing delays between polls, roughly 51 seconds per file at most.
 POLL_DELAYS = (2, 3, 5, 8, 13, 20)
 
 def log(message):
@@ -16,8 +16,8 @@ def log(message):
     print(f"[{timestamp}] {message}")
 
 def exchange_code_for_token(c_id, c_secret, auth_code):
-    """Pomocná funkcia na získanie prvého Refresh Tokenu."""
-    log("Vymieňam autorizačný kód za Refresh Token...")
+    """Helper for obtaining the very first refresh token."""
+    log("Exchanging authorization code for a refresh token...")
     payload = {
         'client_id': c_id,
         'client_secret': c_secret,
@@ -28,16 +28,16 @@ def exchange_code_for_token(c_id, c_secret, auth_code):
     if res.status_code == 200:
         data = res.json()
         print("\n" + "="*50)
-        print(f"TVOJ REFRESH TOKEN: {data['refresh_token']}")
+        print(f"YOUR REFRESH TOKEN: {data['refresh_token']}")
         print("="*50)
-        print("Tento kód si ulož! Použiješ ho pri štarte migrácie.\n")
+        print("Save this token! You will need it to start the migration.\n")
         return data['refresh_token']
     else:
-        log(f"❌ Chyba pri výmene: {res.text}")
+        log(f"❌ Exchange failed: {res.text}")
         return None
 
 class StravaLimiter:
-    """Sleduje spotrebu rate limitov podľa hlavičiek, ktoré vracia Strava."""
+    """Tracks rate limit usage based on the headers Strava returns."""
 
     SHORT_WINDOW = 15 * 60
     SAFETY_RATIO = 0.9
@@ -63,20 +63,20 @@ class StravaLimiter:
                 pass
 
     def wait_if_needed(self):
-        """Uspí, ak sa blíži 15-minútový limit. False znamená vyčerpaný deň."""
+        """Sleeps when the 15-minute limit is near. False means the day is used up."""
         if self.daily_usage >= self.daily_limit * self.SAFETY_RATIO:
             return False
         if self.short_usage >= self.short_limit * self.SAFETY_RATIO:
-            # Okná sú zarovnané na celé štvrťhodiny, takže stačí dospať zvyšok.
+            # Windows are aligned to quarter hours, so sleeping out the rest is enough.
             pause = self.SHORT_WINDOW - (time.time() % self.SHORT_WINDOW) + 5
-            log(f"⚠️ 15-min limit ({self.short_usage}/{self.short_limit}). "
-                f"Spím {pause / 60:.1f} min...")
+            log(f"⚠️ 15-min limit reached ({self.short_usage}/{self.short_limit}). "
+                f"Sleeping for {pause / 60:.1f} min...")
             time.sleep(pause)
             self.short_usage = 0
         return True
 
 class StravaAuth:
-    """Drží access token a obnovuje ho, kým je refresh token platný."""
+    """Holds the access token and renews it for as long as the refresh token is valid."""
 
     REFRESH_MARGIN = 300
 
@@ -98,7 +98,7 @@ class StravaAuth:
             'refresh_token': self.refresh_token, 'grant_type': 'refresh_token'
         }, timeout=30)
         if res.status_code != 200:
-            log(f"❌ Chyba autorizácie: {res.text}")
+            log(f"❌ Authorization failed: {res.text}")
             res.raise_for_status()
         data = res.json()
         self._access_token = data['access_token']
@@ -106,12 +106,12 @@ class StravaAuth:
         rotated = data.get('refresh_token')
         if rotated and rotated != self.refresh_token:
             self.refresh_token = rotated
-            log(f"ℹ️ Strava vydala nový Refresh Token, ulož si ho: {rotated}")
+            log(f"ℹ️ Strava issued a new refresh token, save it: {rotated}")
         valid_to = datetime.fromtimestamp(self._expires_at).strftime("%H:%M:%S")
-        log(f"🔑 Access token obnovený, platí do {valid_to}.")
+        log(f"🔑 Access token renewed, valid until {valid_to}.")
 
 def api_get(url, auth, limiter):
-    """GET s jedným opakovaním po 401, aby expirovaný token beh nezhodil."""
+    """GET with a single retry after a 401, so an expired token cannot kill the run."""
     for attempt in (1, 2):
         token = auth.access_token(force=attempt == 2)
         res = requests.get(url, headers={'Authorization': f'Bearer {token}'},
@@ -119,10 +119,10 @@ def api_get(url, auth, limiter):
         limiter.update(res.headers)
         if res.status_code != 401 or attempt == 2:
             return res
-        log("🔑 Strava odmietla token, obnovujem a skúšam znova...")
+        log("🔑 Strava rejected the token, renewing and retrying...")
 
 def upload_tcx(path, auth, limiter):
-    """Nahrá súbor. Súbor sa otvára v každom pokuse, aby sa dal poslať znova."""
+    """Uploads a file. The file is reopened on each attempt so it can be resent."""
     for attempt in (1, 2):
         token = auth.access_token(force=attempt == 2)
         with open(path, 'rb') as f:
@@ -132,18 +132,18 @@ def upload_tcx(path, auth, limiter):
         limiter.update(res.headers)
         if res.status_code != 401 or attempt == 2:
             return res
-        log("🔑 Strava odmietla token, obnovujem a skúšam znova...")
+        log("🔑 Strava rejected the token, renewing and retrying...")
 
 def wait_for_import(upload_id, auth, limiter):
-    """Čaká na výsledok importu.
+    """Waits for the import result.
 
-    Vracia (stav, detail), kde stav je 'imported', 'duplicate', 'failed'
-    alebo 'unknown'. HTTP 201 znamená len zaradenie do frontu, nie import.
+    Returns (status, detail), where status is 'imported', 'duplicate', 'failed'
+    or 'unknown'. HTTP 201 only means the file was queued, not imported.
     """
     for delay in POLL_DELAYS:
         time.sleep(delay)
         if not limiter.wait_if_needed():
-            return 'unknown', "denný limit vyčerpaný počas kontroly stavu"
+            return 'unknown', "daily limit used up while checking the status"
 
         res = api_get(f"{UPLOADS_URL}/{upload_id}", auth, limiter)
         if res.status_code != 200:
@@ -157,10 +157,10 @@ def wait_for_import(upload_id, auth, limiter):
         if data.get('activity_id'):
             return 'imported', f"activity {data['activity_id']}"
 
-    return 'unknown', "Strava import nedokončila v časovom limite"
+    return 'unknown', "Strava did not finish the import in time"
 
 def move_pair(tcx_path, target_dir):
-    """Presunie .tcx aj jeho párový .json do cieľového adresára."""
+    """Moves the .tcx file and its paired .json into the target directory."""
     os.makedirs(target_dir, exist_ok=True)
     shutil.move(tcx_path, os.path.join(target_dir, os.path.basename(tcx_path)))
     json_path = tcx_path.rsplit('.', 1)[0] + ".json"
@@ -170,23 +170,23 @@ def move_pair(tcx_path, target_dir):
 def migrate(auth, dir_path):
     limiter = StravaLimiter()
     files = sorted(f for f in os.listdir(dir_path) if f.lower().endswith('.tcx'))
-    log(f"Nájdených {len(files)} súborov.")
+    log(f"Found {len(files)} files.")
 
     counts = {'imported': 0, 'duplicate': 0, 'failed': 0, 'unknown': 0}
 
     for filename in files:
         if not limiter.wait_if_needed():
-            log(f"🛑 Denný limit ({limiter.daily_usage}/{limiter.daily_limit}). "
-                f"Pokračuj zajtra, nespracované súbory zostávajú na mieste.")
+            log(f"🛑 Daily limit reached ({limiter.daily_usage}/{limiter.daily_limit}). "
+                f"Continue tomorrow, unprocessed files are left in place.")
             break
 
         tcx_path = os.path.join(dir_path, filename)
-        log(f"Nahrávam: {filename}")
+        log(f"Uploading: {filename}")
         res = upload_tcx(tcx_path, auth, limiter)
 
         if res.status_code != 201:
             counts['failed'] += 1
-            log(f"❌ Upload zamietnutý: {res.text.strip()}")
+            log(f"❌ Upload rejected: {res.text.strip()}")
             continue
 
         upload_id = res.json().get('id')
@@ -195,48 +195,48 @@ def migrate(auth, dir_path):
 
         if status == 'imported':
             move_pair(tcx_path, os.path.join(dir_path, "processed"))
-            log(f"✅ Naimportované – {detail} ({limiter.short_usage}/{limiter.short_limit})")
+            log(f"✅ Imported – {detail} ({limiter.short_usage}/{limiter.short_limit})")
         elif status == 'duplicate':
-            # Aktivita v Strave už je, opakovaný upload by nemal zmysel.
+            # The activity is already on Strava, re-uploading it would be pointless.
             move_pair(tcx_path, os.path.join(dir_path, "duplicates"))
-            log(f"⏭️ Duplikát, presúvam do duplicates/ – {detail}")
+            log(f"⏭️ Duplicate, moving to duplicates/ – {detail}")
         else:
-            log(f"❌ Neúspech ({status}), súbor nechávam na mieste – {detail}")
+            log(f"❌ Not imported ({status}), leaving the file in place – {detail}")
 
         time.sleep(1.5)
 
     print("\n" + "="*50)
-    log(f"Naimportované: {counts['imported']}")
-    log(f"Duplikáty: {counts['duplicate']}")
-    log(f"Chyby: {counts['failed'] + counts['unknown']} (súbory zostali na mieste)")
+    log(f"Imported: {counts['imported']}")
+    log(f"Duplicates: {counts['duplicate']}")
+    log(f"Errors: {counts['failed'] + counts['unknown']} (files left in place)")
     print("="*50)
 
 def main():
     log("=== Endomondo PRO Migrator ===")
 
-    print("\nVyber si akciu:")
-    print("1. Spustiť migráciu (mám Refresh Token)")
-    print("2. Získať Refresh Token (mám len 'code' z prehliadača)")
-    choice = input("Voľba (1/2): ").strip()
+    print("\nChoose an action:")
+    print("1. Run the migration (I have a refresh token)")
+    print("2. Get a refresh token (I only have the 'code' from the browser)")
+    choice = input("Choice (1/2): ").strip()
 
     c_id = input("Client ID: ").strip()
     c_secret = input("Client Secret: ").strip()
 
     if choice == "2":
-        auth_code = input("Vlož 'code' z URL (za code=): ").strip()
+        auth_code = input("Paste the 'code' from the URL (after code=): ").strip()
         exchange_code_for_token(c_id, c_secret, auth_code)
-        input("Stlač Enter pre ukončenie...")
+        input("Press Enter to exit...")
         return
 
     r_token = input("Refresh Token: ").strip()
-    dir_path = input("Cesta k exportu: ").strip()
+    dir_path = input("Path to the export: ").strip()
 
     try:
         migrate(StravaAuth(c_id, c_secret, r_token), dir_path)
     except Exception as e:
-        log(f"Kritická chyba: {e}")
+        log(f"Critical error: {e}")
 
-    input("\nHotovo. Enter pre ukončenie...")
+    input("\nDone. Press Enter to exit...")
 
 if __name__ == "__main__":
     main()
