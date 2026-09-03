@@ -1,95 +1,102 @@
 # endomondo-strava-importer
 
-Konzolový nástroj na dávkovú migráciu tréningov z Endomondo exportu do Stravy.
-Prechádza adresár s `.tcx` súbormi, nahráva ich cez Strava API v3 a rešpektuje
-pritom rate limity Stravy.
+A console tool for bulk-migrating workouts from an Endomondo export to Strava.
+It walks a directory of `.tcx` files, uploads them through the Strava API v3
+and stays within Strava's rate limits.
 
-## Ako to funguje
+## How it works
 
-- Načíta všetky `.tcx` súbory v zadanom adresári a postupne ich nahráva na
-  endpoint `POST /api/v3/uploads`.
-- **Overí výsledok importu.** HTTP 201 znamená len zaradenie do frontu, preto
-  sa skript následne doptáva na `GET /api/v3/uploads/{id}`, kým Strava nevráti
-  `activity_id` (úspech) alebo `error`.
-- **Presúva len skutočne naimportované súbory** do `processed/` (aj s párovým
-  `.json`). Duplikáty idú do `duplicates/`, pretože v Strave už sú a opakovaný
-  upload by nemal zmysel. Súbory, ktoré zlyhali, zostávajú na mieste, takže sa
-  pri ďalšom behu skúsia znova — beh je teda **obnoviteľný**.
-- **Sám si obnovuje access token.** Ten platí 6 hodín; skript ho obnoví pred
-  expiráciou aj po odmietnutí requestu s HTTP 401, takže dlhý beh neprepadne.
-  Ak Strava vydá nový refresh token, skript ho vypíše.
-- Rate limity číta z hlavičiek `X-RateLimit-Limit` a `X-RateLimit-Usage`, čiže
-  sa prispôsobí limitom tvojej aplikácie. Pri 90 % 15-minútového okna dospí
-  zvyšok okna, pri 90 % denného limitu korektne skončí.
-- Na konci vypíše súhrn: koľko aktivít sa naimportovalo, koľko bolo duplikátov
-  a koľko zlyhalo.
+- Reads every `.tcx` file in the given directory and uploads them one by one to
+  `POST /api/v3/uploads`.
+- **Verifies the import result.** HTTP 201 only means the file was queued, so
+  the script then polls `GET /api/v3/uploads/{id}` until Strava returns an
+  `activity_id` (success) or an `error`.
+- **Moves only genuinely imported files** to `processed/` (together with the
+  paired `.json`). Duplicates go to `duplicates/`, since they are already on
+  Strava and re-uploading them would be pointless. Failed files stay in place
+  and are retried on the next run, which makes the migration **resumable**.
+- **Renews the access token on its own.** The token is valid for 6 hours; the
+  script refreshes it before it expires and also after a request is rejected
+  with HTTP 401, so a long run does not fall over. If Strava issues a new
+  refresh token, the script prints it.
+- Reads rate limits from the `X-RateLimit-Limit` and `X-RateLimit-Usage`
+  headers, so it adapts to your application's limits. At 90% of the 15-minute
+  window it sleeps out the rest of the window; at 90% of the daily limit it
+  stops cleanly.
+- Prints a summary at the end: how many activities were imported, how many were
+  duplicates and how many failed.
 
-## Požiadavky
+## Requirements
 
 - Python 3.8+
 - `pip install -r requirements.txt`
 
-Alternatívne sa dá použiť samostatné `.exe` (viď [Build](#build)), ktoré
-Python na cieľovom stroji nepotrebuje.
+Alternatively use the standalone `.exe` (see [Build](#build)), which does not
+need Python on the target machine.
 
-## Nastavenie Strava API
+## Strava API setup
 
-1. Na [strava.com/settings/api](https://www.strava.com/settings/api) vytvor
-   aplikáciu. Ako *Authorization Callback Domain* zadaj `localhost`.
-2. Odpíš si **Client ID** a **Client Secret**.
-3. V prehliadači otvor autorizačnú URL (nahraď `CLIENT_ID`):
+1. Create an application at
+   [strava.com/settings/api](https://www.strava.com/settings/api). Set
+   *Authorization Callback Domain* to `localhost`.
+2. Note down your **Client ID** and **Client Secret**.
+3. Open the authorization URL in a browser (replace `CLIENT_ID`):
 
    ```
    https://www.strava.com/oauth/authorize?client_id=CLIENT_ID&redirect_uri=http://localhost&response_type=code&approval_prompt=force&scope=activity:write
    ```
 
-   Scope `activity:write` je povinný — bez neho nahrávanie zlyhá.
-4. Po potvrdení ťa Strava presmeruje na neexistujúcu `localhost` adresu.
-   Z URL v adresnom riadku skopíruj hodnotu parametra `code=`.
-5. Spusti skript, zvoľ možnosť **2** a vlož `code`. Skript ho vymení za
-   **Refresh Token**, ktorý si ulož — platí trvalo a použiješ ho pri každom
-   ďalšom behu.
+   The `activity:write` scope is mandatory — uploads fail without it.
+4. After you approve, Strava redirects you to a non-existent `localhost`
+   address. Copy the value of the `code=` parameter from the address bar.
+5. Run the script, pick option **2** and paste the `code`. The script exchanges
+   it for a **refresh token** — save it, as it does not expire and you will use
+   it on every subsequent run.
 
-## Použitie
+## Usage
 
 ```bash
 python endomondo-strava-importer.py
 ```
 
-Zvoľ možnosť **1** a zadaj Client ID, Client Secret, Refresh Token a cestu
-k adresáru s exportom z Endomonda.
+Pick option **1** and enter your Client ID, Client Secret, refresh token and
+the path to the directory holding the Endomondo export.
 
 ## Build
 
-Samostatný `.exe` pre Windows sa vytvára PyInstallerom. Najjednoduchšie cez
-priložený skript, ktorý doinštaluje závislosti aj PyInstaller a spustí build:
+The standalone Windows `.exe` is produced by PyInstaller. The easiest way is
+the bundled script, which installs the dependencies and PyInstaller and then
+runs the build:
 
 ```powershell
 .\build.ps1
 ```
 
-Ekvivalent naruby:
+The equivalent by hand:
 
 ```bash
 pip install -r requirements.txt pyinstaller
 pyinstaller --noconfirm --clean endomondo-strava-importer.spec
 ```
 
-Výsledok je `dist/endomondo-strava-importer.exe` (~12 MB, Python na cieľovom
-stroji netreba). Konfigurácia buildu je v `endomondo-strava-importer.spec`.
-Adresáre `build/` a `dist/` sú zámerne v `.gitignore` — binárky patria do
-GitHub Releases, nie do repozitára.
+The result is `dist/endomondo-strava-importer.exe` (~12 MB, no Python needed on
+the target machine). The build configuration lives in
+`endomondo-strava-importer.spec`. The `build/` and `dist/` directories are
+deliberately in `.gitignore` — binaries belong in GitHub Releases, not in the
+repository.
 
-## Známe obmedzenia
+## Known limitations
 
-- Spracúvajú sa len `.tcx` súbory a len v zadanom adresári, nie v podadresároch.
-- Pri prechodných chybách (429, 5xx) sa upload neopakuje — súbor však zostane
-  na mieste, takže ho zachytí ďalší beh.
-- Ak Strava import nedokončí do ~50 sekúnd, výsledok sa vyhodnotí ako neznámy
-  a súbor zostane na mieste. Pri ďalšom behu sa nahrá znova a skončí ako
-  duplikát.
-- Client Secret sa zadáva cez bežný `input()`, čiže je vidieť v konzole.
+- Only `.tcx` files are processed, and only in the given directory, not in
+  subdirectories.
+- Transient failures (429, 5xx) are not retried — the file stays in place
+  though, so the next run picks it up.
+- If Strava does not finish the import within roughly 50 seconds, the result is
+  treated as unknown and the file stays in place. The next run uploads it again
+  and it ends up as a duplicate.
+- The Client Secret is read with a plain `input()`, so it is visible in the
+  console.
 
-## Licencia
+## License
 
 [MIT](LICENSE)
